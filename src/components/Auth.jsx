@@ -16,7 +16,7 @@ export default function Auth() {
   return (
     <div className="auth-container">
         <h1>MuseShare</h1>
-        <p className="mb-6">Collaborative music annotation platform</p>
+        <p className="mb-6">Collaborative score annotation platform</p>
         <button onClick={signInWithGoogle}>
         Sign in with Google
         </button>

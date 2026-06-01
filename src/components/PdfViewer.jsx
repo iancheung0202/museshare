@@ -29,11 +29,38 @@ export default function PDFViewer({ groupId, onBack }) {
   const [annotationMode, setAnnotationMode] = useState('group');
   const [showGroupAnnotations, setShowGroupAnnotations] = useState(true);
   const [showPersonalAnnotations, setShowPersonalAnnotations] = useState(true);
+  
+  const [activeTool, setActiveTool] = useState('view');
+  const [brushColor, setBrushColor] = useState('#ff0000');
+  const [strokeWidth, setStrokeWidth] = useState(3);
+  const touchStartX = useRef(null);
+  
+  const [transitionImg, setTransitionImg] = useState(null);
+  const [animClass, setAnimClass] = useState('');
+  const [pendingAnim, setPendingAnim] = useState(null);
+  const lastFlipTimeRef = useRef(0);
+  
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const fullscreenContainerRef = useRef(null);
 
   const canvasRef = useRef(null);
   const timeoutRef = useRef(null);
 
   const sanitizeKey = (key) => (key ? key.replace(/[.#$/\[\]]/g, "_") : "");
+
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+        fullscreenContainerRef.current?.requestFullscreen();
+    } else {
+        document.exitFullscreen();
+    }
+  };
 
   // Fetch group data & members
   useEffect(() => {
@@ -121,8 +148,51 @@ export default function PDFViewer({ groupId, onBack }) {
   }, [currentPage]);
 
   // Page navigation
-  const nextPage = () => pdfDoc && setCurrentPage(prev => Math.min(prev + 1, pdfDoc.numPages));
-  const prevPage = () => pdfDoc && setCurrentPage(prev => Math.max(prev - 1, 1));
+  const captureCurrentPage = () => {
+    if (!canvasRef.current) return null;
+    const pdfCanvas = canvasRef.current;
+    const annoCanvas = pdfCanvas.nextElementSibling;
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = pdfCanvas.width;
+    tempCanvas.height = pdfCanvas.height;
+    const ctx = tempCanvas.getContext('2d');
+    ctx.drawImage(pdfCanvas, 0, 0);
+    if (annoCanvas) ctx.drawImage(annoCanvas, 0, 0);
+    return tempCanvas.toDataURL();
+  };
+
+  const changePageWithAnim = (targetPage) => {
+    if (targetPage === currentPage || targetPage < 1 || targetPage > totalPages) return;
+    const direction = targetPage > currentPage ? 'next' : 'prev';
+    const snapshot = captureCurrentPage();
+
+    // Check for rapid consecutive flipping (less than 500ms)
+    const now = Date.now();
+    const isRapid = (now - lastFlipTimeRef.current) < 500;
+    lastFlipTimeRef.current = now;
+
+    // 1. Keep the old page visible as an image
+    setTransitionImg(snapshot);
+
+    // 2. Queue up the appropriate animation (fade for rapid, slide for normal)
+    const nextAnim = isRapid 
+      ? 'animate-fade-in' 
+      : (direction === 'next' ? 'animate-slide-in-next' : 'animate-slide-in-prev');
+    setPendingAnim(nextAnim);
+
+    // 3. Immediately set rendered to false
+    setPageRendered(false);
+
+    // 4. Defer changing the page by 0ms. 
+    // This forces React to paint the `transitionImg` to the screen FIRST,
+    // before pdf.js clears the canvas, eliminating the black flicker.
+    setTimeout(() => {
+      setCurrentPage(targetPage);
+    }, 0);
+  };
+
+  const nextPage = () => changePageWithAnim(currentPage + 1);
+  const prevPage = () => changePageWithAnim(currentPage - 1);
 
   const handlePageInputChange = (e) => {
     const value = e.target.value;
@@ -134,7 +204,7 @@ export default function PDFViewer({ groupId, onBack }) {
     const pageNum = parseInt(value, 10);
     if (pageNum < 1 || pageNum > totalPages) return;
 
-    timeoutRef.current = setTimeout(() => setCurrentPage(pageNum), 100);
+    timeoutRef.current = setTimeout(() => changePageWithAnim(pageNum), 100);
   };
 
   const handlePageInputSubmit = (e) => {
@@ -142,8 +212,25 @@ export default function PDFViewer({ groupId, onBack }) {
     if (!pageInput) return;
 
     const pageNum = parseInt(pageInput, 10);
-    if (pageNum >= 1 && pageNum <= totalPages) setCurrentPage(pageNum);
+    if (pageNum >= 1 && pageNum <= totalPages) changePageWithAnim(pageNum);
     else setPageInput(String(currentPage));
+  };
+
+  // Support both mouse dragging and touch swiping
+  const handlePointerDown = (e) => {
+    if (activeTool !== 'view') return;
+    touchStartX.current = e.clientX || (e.touches && e.touches[0].clientX);
+  };
+
+  const handlePointerUp = (e) => {
+    if (activeTool !== 'view' || touchStartX.current === null) return;
+    const clientX = e.clientX || (e.changedTouches && e.changedTouches[0].clientX);
+    const diff = touchStartX.current - clientX;
+    
+    if (diff > 50) changePageWithAnim(currentPage + 1);
+    else if (diff < -50) changePageWithAnim(currentPage - 1);
+    
+    touchStartX.current = null;
   };
 
   const handleFileAdded = () => {
@@ -257,6 +344,20 @@ export default function PDFViewer({ groupId, onBack }) {
       default: return 0;
     }
   });
+
+  // Trigger animation ONLY after the new page is fully rendered
+  useEffect(() => {
+    if (pageRendered && pendingAnim) {
+      setAnimClass(pendingAnim);
+      setPendingAnim(null);
+      
+      // Clear the transition image after animation completes
+      setTimeout(() => {
+        setTransitionImg(null);
+        setAnimClass('');
+      }, 300); // 300ms matches your CSS slide animation duration
+    }
+  }, [pageRendered, pendingAnim]);
 
   return (
     <div className="pdf-container">
@@ -407,142 +508,226 @@ export default function PDFViewer({ groupId, onBack }) {
           </div>
         </div>
       ) : (
-        <div className="pdf-viewer-area">
-          {/* Add file name display with editing */}
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '1rem' }}>
-            <h3>Currently viewing: </h3>
-            {currentFile && (
-                currentFile.owner === currentUser.uid ? (
-                    <div
-                    contentEditable
-                    suppressContentEditableWarning
-                    onFocus={(e) => { e.target.dataset.oldValue = currentFile.name }}
-                    onBlur={(e) => {
-                        const newName = e.target.textContent.trim();
-                        if (!newName) {
-                        e.target.textContent = e.target.dataset.oldValue;
-                        } else {
-                        updateFileName(currentFile.id, newName);
-                        }
-                    }}
-                    style={{ 
-                        marginLeft: '10px',
-                        marginBottom: '10px',
-                        padding: '0.25rem 0.5rem',
-                        background: 'rgba(15, 23, 42, 0.5)',
-                        border: '1px solid rgba(255, 255, 255, 0.1)',
-                        borderRadius: 'var(--radius-sm)',
-                        minWidth: '200px'
-                    }}
-                    >
-                    {currentFile.name}
-                    </div>
-                ) : (
-                    <div style={{ marginLeft: '10px', marginBottom: '12px', fontWeight: 'bold' }}>
-                    {currentFile.name}
-                    </div>
-                )
-            )}
-          </div>
-          <div className="pdf-controls">
-            {/* Add visibility toggles */}
-            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-              <label>
-                <input 
-                  type="checkbox"
-                  checked={showGroupAnnotations}
-                  onChange={(e) => setShowGroupAnnotations(e.target.checked)}
-                /> Show Group
-              </label>
-              <label>
-                <input 
-                  type="checkbox"
-                  checked={showPersonalAnnotations}
-                  onChange={(e) => setShowPersonalAnnotations(e.target.checked)}
-                /> Show Personal
-              </label>
-            </div>
+        <div className={`pdf-viewer-area ${isFullscreen ? 'fullscreen-mode' : ''}`} ref={fullscreenContainerRef}>
 
-            {/* Add annotation mode selector */}
-            {currentUser && (
-                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                    <span>Annotation Mode:</span>
+          {!isFullscreen && (
+            <>
+              {/* Add file name display with editing */}
+              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '1rem' }}>
+                <h3>Currently viewing: </h3>
+                {currentFile && (
+                    currentFile.owner === currentUser.uid ? (
+                        <div
+                        contentEditable
+                        suppressContentEditableWarning
+                        onFocus={(e) => { e.target.dataset.oldValue = currentFile.name }}
+                        onBlur={(e) => {
+                            const newName = e.target.textContent.trim();
+                            if (!newName) {
+                            e.target.textContent = e.target.dataset.oldValue;
+                            } else {
+                            updateFileName(currentFile.id, newName);
+                            }
+                        }}
+                        style={{ 
+                            marginLeft: '10px',
+                            marginBottom: '10px',
+                            padding: '0.25rem 0.5rem',
+                            background: 'rgba(15, 23, 42, 0.5)',
+                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                            borderRadius: 'var(--radius-sm)',
+                            minWidth: '200px'
+                        }}
+                        >
+                        {currentFile.name}
+                        </div>
+                    ) : (
+                        <div style={{ marginLeft: '10px', marginBottom: '12px', fontWeight: 'bold' }}>
+                        {currentFile.name}
+                        </div>
+                    )
+                )}
+              </div>
+              <div className="pdf-controls" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', alignItems: 'flex-start' }}>
+                <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
                     <select 
-                    value={annotationMode}
-                    onChange={(e) => setAnnotationMode(e.target.value)}
-                    style={{
+                      value={activeTool} 
+                      onChange={(e) => setActiveTool(e.target.value)}
+                      style={{
                         background: 'rgba(15, 23, 42, 0.5)',
                         border: '1px solid rgba(255, 255, 255, 0.1)',
                         borderRadius: 'var(--radius-sm)',
                         color: 'var(--light)',
                         padding: '0.25rem 0.5rem'
-                    }}
-                    disabled={!isCreator} // Disable for non-creators
+                      }}
                     >
-                    {isCreator && <option value="group">Group</option>}
-                    <option value="personal">Personal</option>
+                      <option value="view">View (Swipe)</option>
+                      <option value="draw_free">Free Draw</option>
+                      <option value="draw_line">Straight Line</option>
+                      <option value="erase_pixel">Eraser (Pixel)</option>
+                      <option value="erase_object">Eraser (Object)</option>
                     </select>
-                </div>
-            )}
-          </div>
-          <div className="pdf-controls">
-            <button onClick={prevPage}>Previous</button>
-            <form onSubmit={handlePageInputSubmit} style={{display: 'flex', alignItems: 'center' }}>
-              <span style={{ marginRight: '0.5rem' }}>Page:</span>
-              <input
-                type="number"
-                value={pageInput}
-                onChange={handlePageInputChange}
-                onBlur={handlePageInputSubmit}
-                style={{
-                  width: '70px',
-                  textAlign: 'center',
-                  padding: '0.25rem 0.5rem',
-                  marginTop: '1rem',
-                  marginRight: '0.5rem',
-                  background: 'rgba(15, 23, 42, 0.5)',
-                  border: '1px solid rgba(255, 255, 255, 0.1)',
-                  borderRadius: 'var(--radius-sm)',
-                  color: 'var(--light)'
-                }}
-                min="1"
-                max={totalPages}
-              />
-              <span>of {totalPages}</span>
-            </form>
-            <button onClick={nextPage}>Next</button>
-          </div>
 
-          <div className="pdf-viewer-wrapper">
-            <canvas ref={canvasRef} style={{ display: 'block' }} />
-            <AnnotationCanvas
-                groupId={groupId}
-                fileId={currentFile?.id} 
-                page={currentPage}
-                pageRendered={pageRendered}
-                parentCanvasRef={canvasRef}
-                annotationMode={annotationMode}
-                showGroupAnnotations={showGroupAnnotations}
-                showPersonalAnnotations={showPersonalAnnotations}
-                currentUser={{
-                    ...currentUser,
-                    isCreator: isCreator 
-                }}
-            />
-          </div>
-          <div style={{ textAlign: 'center', marginTop: '1rem'}}>
-            <button className="danger" onClick={deleteCurrentFile}>Delete File</button>
-            {currentFile?.driveId && (
-              <a 
-                href={`https://drive.google.com/file/d/${currentFile.driveId}/view`} 
-                target="_blank" 
-                rel="noopener noreferrer"
-              >
-                <button className="secondary" style={{marginLeft: '1rem' }}>View Original <FiExternalLink />
-                </button>
-              </a>
+                    {activeTool !== 'view' && activeTool !== 'erase_object' && (
+                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                         {activeTool !== 'erase_pixel' && (
+                             <input 
+                               type="color" 
+                               value={brushColor}
+                               onChange={(e) => setBrushColor(e.target.value)}
+                               style={{ width: '30px', height: '30px', padding: 0, border: 'none', background: 'none' }}
+                             />
+                         )}
+                         <span style={{ fontSize: '0.8rem' }}>Thickness:</span>
+                         <input 
+                           type="range" 
+                           min="1" 
+                           max="20" 
+                           value={strokeWidth}
+                           onChange={(e) => setStrokeWidth(parseInt(e.target.value, 10))}
+                           style={{ width: '80px' }}
+                         />
+                      </div>
+                    )}
+
+                    {/* Annotation Mode Selector */}
+                    {currentUser && (
+                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                            <span>Mode:</span>
+                            <select 
+                            value={annotationMode}
+                            onChange={(e) => setAnnotationMode(e.target.value)}
+                            style={{
+                                background: 'rgba(15, 23, 42, 0.5)',
+                                border: '1px solid rgba(255, 255, 255, 0.1)',
+                                borderRadius: 'var(--radius-sm)',
+                                color: 'var(--light)',
+                                padding: '0.25rem 0.5rem'
+                            }}
+                            disabled={!isCreator} // Disable for non-creators
+                            >
+                            {isCreator && <option value="group">Group</option>}
+                            <option value="personal">Personal</option>
+                            </select>
+                        </div>
+                    )}
+                </div>
+
+                {/* Add visibility toggles */}
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <label>
+                    <input 
+                      type="checkbox"
+                      checked={showGroupAnnotations}
+                      onChange={(e) => setShowGroupAnnotations(e.target.checked)}
+                    /> Show Group
+                  </label>
+                  <label>
+                    <input 
+                      type="checkbox"
+                      checked={showPersonalAnnotations}
+                      onChange={(e) => setShowPersonalAnnotations(e.target.checked)}
+                    /> Show Personal
+                  </label>
+                </div>
+              </div>
+              <div className="pdf-controls">
+                <button onClick={prevPage}>Previous</button>
+                <form onSubmit={handlePageInputSubmit} style={{display: 'flex', alignItems: 'center' }}>
+                  <span style={{ marginRight: '0.5rem' }}>Page:</span>
+                  <input
+                    type="number"
+                    value={pageInput}
+                    onChange={handlePageInputChange}
+                    onBlur={handlePageInputSubmit}
+                    style={{
+                      width: '70px',
+                      textAlign: 'center',
+                      padding: '0.25rem 0.5rem',
+                      marginTop: '1rem',
+                      marginRight: '0.5rem',
+                      background: 'rgba(15, 23, 42, 0.5)',
+                      border: '1px solid rgba(255, 255, 255, 0.1)',
+                      borderRadius: 'var(--radius-sm)',
+                      color: 'var(--light)'
+                    }}
+                    min="1"
+                    max={totalPages}
+                  />
+                  <span>of {totalPages}</span>
+                </form>
+                <button onClick={nextPage}>Next</button>
+              </div>
+            </>
+          )}
+
+          <div style={{ position: 'relative', display: 'flex', justifyContent: 'center', width: '100%', overflow: 'hidden' }}>
+            {transitionImg && (
+                <img 
+                    src={transitionImg} 
+                    style={{ 
+                        position: 'absolute', 
+                        top: 0, 
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        maxWidth: '100%', 
+                        maxHeight: isFullscreen ? '100vh' : '70vh',
+                        objectFit: 'contain', 
+                        zIndex: 1 
+                    }} 
+                />
             )}
+            
+            <div 
+              className={`pdf-canvas-container ${animClass}`} 
+              onPointerDown={handlePointerDown} 
+              onPointerUp={handlePointerUp}
+              onTouchStart={handlePointerDown}
+              onTouchEnd={handlePointerUp}
+              style={{ 
+                touchAction: activeTool === 'view' ? 'pan-y' : 'none', 
+                zIndex: 2, 
+                position: 'relative',
+                opacity: (!pageRendered && transitionImg) ? 0 : 1 // <-- Hides canvas during render
+              }}
+            >
+              <canvas className="pdf-layer" ref={canvasRef} />
+              <AnnotationCanvas
+                  groupId={groupId}
+                  fileId={currentFile?.id} 
+                  page={currentPage}
+                  pageRendered={pageRendered}
+                  parentCanvasRef={canvasRef}
+                  annotationMode={annotationMode}
+                  showGroupAnnotations={showGroupAnnotations}
+                  showPersonalAnnotations={showPersonalAnnotations}
+                  currentUser={{
+                      ...currentUser,
+                      isCreator: isCreator 
+                  }}
+                  activeTool={activeTool}
+                  brushColor={brushColor}
+                  strokeWidth={strokeWidth}
+              />
+            </div>
           </div>
+          
+          {!isFullscreen && (
+            <div style={{ textAlign: 'center', marginTop: '1rem'}}>
+              <button className="secondary" onClick={toggleFullscreen} style={{marginRight: '1rem'}}>Fullscreen</button>
+              <button className="danger" onClick={deleteCurrentFile}>Delete File</button>
+              {currentFile?.driveId && (
+                <a 
+                  href={`https://drive.google.com/file/d/${currentFile.driveId}/view`} 
+                  target="_blank" 
+                  rel="noopener noreferrer"
+                >
+                  <button className="secondary" style={{marginLeft: '1rem' }}>View Original <FiExternalLink />
+                  </button>
+                </a>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "museshare-web",
     "public": "dist",
     "ignore": [
       "firebase.json",
